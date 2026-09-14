@@ -1,3 +1,5 @@
+import os
+import shutil
 import pandas as pd
 import requests
 import urllib3
@@ -5,96 +7,113 @@ from PIL import Image
 from io import BytesIO
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-import os
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import shutil
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-domains_df = pd.read_parquet('logos.snappy.parquet')
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PARQUET_PATH = REPO_ROOT / 'Data' / 'logos.snappy.parquet'
+FAVICON_DIR = REPO_ROOT / 'favicons'
+SCRAPED_DIR = REPO_ROOT / 'scraped_logos'
+FINAL_DIR = REPO_ROOT / 'logos_final'
+
+domains_df = pd.read_parquet(PARQUET_PATH)
 domains_df['url'] = 'https://' + domains_df['domain']
 domains_df['favicon_url'] = domains_df['url'] + '/favicon.ico'
-os.makedirs('favicons', exist_ok=True)
-os.makedirs('scraped_logos', exist_ok=True)
+
+for directory in (FAVICON_DIR, SCRAPED_DIR, FINAL_DIR):
+    directory.mkdir(exist_ok=True)
 
 request_headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/117.0 Safari/537.36'
 }
-success_favicon = 0
-success_scrape = 0
+
+
+def fetch_image(url):
+    """Return image bytes for url, retrying once without SSL verification."""
+    for verify in (True, False):
+        try:
+            response = requests.get(url, headers=request_headers, timeout=10, verify=verify)
+        except requests.exceptions.SSLError:
+            continue
+        except requests.exceptions.RequestException:
+            return None
+        if response.status_code == 200 and 'image' in response.headers.get('Content-Type', ''):
+            return response.content
+    return None
+
+
+def fetch_page(url):
+    for verify in (True, False):
+        try:
+            response = requests.get(url, headers=request_headers, timeout=10, verify=verify)
+        except requests.exceptions.SSLError:
+            continue
+        except requests.exceptions.RequestException:
+            return None
+        if response.status_code == 200:
+            return response.text
+    return None
+
+
+def save_image(content, path):
+    try:
+        Image.open(BytesIO(content)).convert('RGBA').save(path)
+        return True
+    except Exception:
+        return False
+
 
 def download_logo(row):
-    global success_favicon, success_scrape
-    domain = row['domain']
-    try:
-        response = requests.get(row['favicon_url'], headers=request_headers, timeout=10)
-        if response.status_code == 200 and 'image' in response.headers.get('Content-Type', ''):
-            Image.open(BytesIO(response.content)).save(f'favicons/{domain}.png')
-            success_favicon += 1
-            return f"[FAVICON OK] {domain}"
-    except requests.exceptions.ConnectionError as e:
-        return f"[DNS FAIL] {domain} - {e}"
-    except Exception:
-        try:
-            response = requests.get(row['favicon_url'], headers=request_headers, timeout=10, verify=False)
-            if response.status_code == 200 and 'image' in response.headers.get('Content-Type', ''):
-                Image.open(BytesIO(response.content)).save(f'favicons/{domain}.png')
-                success_favicon += 1
-                return f"[FAVICON OK - NO SSL] {domain}"
-        except requests.exceptions.ConnectionError as e:
-            return f"[DNS FAIL] {domain} - {e}"
-        except Exception:
-            pass
-          
-    try:
-        try:
-            page = requests.get(f'https://{domain}', headers=request_headers, timeout=10)
-        except requests.exceptions.ConnectionError as e:
-            return f"[DNS FAIL] {domain} - {e}"
-        except Exception:
-            page = requests.get(f'https://{domain}', headers=request_headers, timeout=10, verify=False)
+    """Try the favicon first, then fall back to scraping the homepage icon link.
 
-        if page.status_code == 200:
-            soup = BeautifulSoup(page.text, 'html.parser')
-            icon_link = soup.find('link', rel=lambda x: x and 'icon' in x.lower())
-            if icon_link and icon_link.get('href'):
-                logo_url = urljoin(f'https://{domain}', icon_link['href'])
-                try:
-                    img_response = requests.get(logo_url, headers=request_headers, timeout=10)
-                    if img_response.status_code == 200 and 'image' in img_response.headers.get('Content-Type', ''):
-                        Image.open(BytesIO(img_response.content)).save(f'scraped_logos/{domain}.png')
-                        success_scrape += 1
-                        return f"[SCRAPED OK] {domain}"
-                except requests.exceptions.ConnectionError as e:
-                    return f"[DNS FAIL] {domain} - {e}"
-                except Exception:
-                    try:
-                        img_response = requests.get(logo_url, headers=request_headers, timeout=10, verify=False)
-                        if img_response.status_code == 200 and 'image' in img_response.headers.get('Content-Type', ''):
-                            Image.open(BytesIO(img_response.content)).save(f'scraped_logos/{domain}.png')
-                            success_scrape += 1
-                            return f"[SCRAPED OK - NO SSL] {domain}"
-                    except requests.exceptions.ConnectionError as e:
-                        return f"[DNS FAIL] {domain} - {e}"
-        return f"[FAIL] {domain} - No icon found"
-    except Exception as e:
-        return f"[ERROR] {domain} - {e}"
+    Returns (source, message) where source is 'favicon', 'scrape' or None.
+    """
+    domain = row['domain']
+
+    content = fetch_image(row['favicon_url'])
+    if content and save_image(content, FAVICON_DIR / f'{domain}.png'):
+        return 'favicon', f'[FAVICON OK] {domain}'
+
+    html = fetch_page(f'https://{domain}')
+    if html is None:
+        return None, f'[FAIL] {domain} - unreachable'
+
+    soup = BeautifulSoup(html, 'html.parser')
+    icon_link = soup.find('link', rel=lambda value: value and 'icon' in str(value).lower())
+    if not (icon_link and icon_link.get('href')):
+        return None, f'[FAIL] {domain} - no icon found'
+
+    logo_url = urljoin(f'https://{domain}', icon_link['href'])
+    content = fetch_image(logo_url)
+    if content and save_image(content, SCRAPED_DIR / f'{domain}.png'):
+        return 'scrape', f'[SCRAPED OK] {domain}'
+
+    return None, f'[FAIL] {domain} - icon could not be downloaded'
+
+
+success_favicon = 0
+success_scrape = 0
 
 with ThreadPoolExecutor(max_workers=20) as executor:
     futures = [executor.submit(download_logo, row) for _, row in domains_df.iterrows()]
     for future in as_completed(futures):
-        print(future.result())
+        source, message = future.result()
+        if source == 'favicon':
+            success_favicon += 1
+        elif source == 'scrape':
+            success_scrape += 1
+        print(message)
 
-print("\nDownload completed.")
-print(f"Favicon successful downloads: {success_favicon}")
-print(f"Scraping successful downloads: {success_scrape}")
-print(f"Total websites processed: {len(domains_df)}")r
-os.makedirs('logos_final', exist_ok=True)
+print('\nDownload completed.')
+print(f'Favicon successful downloads: {success_favicon}')
+print(f'Scraping successful downloads: {success_scrape}')
+print(f'Total websites processed: {len(domains_df)}')
 
-for file in os.listdir('favicons'):
-    shutil.copy(os.path.join('favicons', file), os.path.join('logos_final', file))
-for file in os.listdir('scraped_logos'):
-    shutil.copy(os.path.join('scraped_logos', file), os.path.join('logos_final', file))
+for source_dir in (FAVICON_DIR, SCRAPED_DIR):
+    for file in os.listdir(source_dir):
+        shutil.copy(source_dir / file, FINAL_DIR / file)
 
-print("\nAll images have been copied to 'logos_final/'")
-print(f"Total images in 'logos_final': {len(os.listdir('logos_final'))}")
-print("\nProcess completed successfully.")
+print(f"\nAll images have been copied to '{FINAL_DIR.name}/'")
+print(f"Total images in '{FINAL_DIR.name}': {len(os.listdir(FINAL_DIR))}")
